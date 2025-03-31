@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 '''
 Functions supporting slab models. 
 Models are written as classes in the second half of this module.
+We're in the wstress branch, meaning that we're assuming that ERA5 data have wind stress in them.
 '''
 
 def refine_time( xr_obj, dt ):
@@ -45,55 +46,134 @@ def vort_div( xr_obj ):
 def get_f( lat ):
     return 4 * np.pi * np.sin( lat / 180 * np.pi ) / 24 / 3600
 
+
+
+def near_inertial_filter( xr_obj , dt, window = [0.8,1.2] ):
+    # Filter out the near-inertial frequency band along time dimension
+    # Begin by computing f for the object
+    f = get_f( xr_obj['latitude'] )
+
+
+
 # ---------------------------------
 # ----- Time to write the models
 # ---------------------------------
 
-
 class double_decker:
     def __init__( self, ERA5 ):
+
+        self.date = ERA5['time']
         self.ERA5 = self.prepare_atm( ERA5 );
+        self.ERA5['time'] = [ ( pd.to_datetime( tt ) - datetime( 2010,1, 1, 0,0,0) ).total_seconds() \
+                             for tt in self.ERA5['time'].values ]
+        self.f = get_f( ERA5['latitude'] )
+        self.npoints = ( len( ERA5['latitude'].values ) * len( ERA5['longitude'] ) );
+    
+    # Use this order to store and access variables in solutions
+    stack_order = ['zeta','sigma','h']
 
     def prepare_atm( self, era_dat ):
-        era_dat['tau'] = wstress( era_dat )
+        era_dat = era_dat.rename( { 'avg_iews' : 'tau_x' , 
+                                   'avg_inss' : 'tau_y' } )
+        
+        era_dat['tau'] = era_dat['tau_x'] + 1j * era_dat['tau_y']
         tau_curl, tau_div = vort_div( era_dat['tau'] )
         era_dat['G'] = tau_curl + 1j * tau_div
+        era_dat = era_dat.drop_vars( ['tau_x','tau_y'] )
         return era_dat
 
-    def empty( self ):
-        vec = np.zeros( self.ERA5['time'].values.shape )
-        vec = vec + 1j*vec.copy()
-        return vec
-
-    def initial_conditions( self, h0 ):
-        variables = ['zeta', 'sigma', 'h', 'r' ]
-        #data = xr.Dataset( )
-        data = dict()
-        for jj in variables:
-            #data[ jj ] = xr.DataArray( data = self.empty(), 
-            #                dims = ('time'),
-            #                coords = { 'time': self.ERA5['time'].values } )
-            data[jj] = self.empty()
-        data['h'] = np.abs( data['h'] ); # delete imaginary
-        data['h'][0] = h0
-        return data
-
-
-    def new_solution( self, x0, y0, h0 ):
-        # Learn basic physical facts about the world
-        f = get_f( y0 )
-        location = { 'latitude':y0, 'longitude':x0 }
-        forcing = self.ERA5.sel( location, method = 'nearest' )
-        #time = self.ERA5['time'];
-        #dt = pd.to_datetime( ( time[1] - time[0]).values , unit = 's' )
-
-        # Solutions will start from zero.
-        ml_sol = self.initial_conditions( h0 ) # dict for ML solution
-        th_sol = self.initial_conditions( h0 ) # dict for thermocline
+    def get_empty( self ):
+        # Get xr array full of zeros with same format as forcing
+        dat = self.ERA5['tau'].isel( time = 0 ) * 0
+        return dat.drop_vars( 'time' )
         
-        # Generate a solver based on this information
-        return decker_solver( ml_sol, th_sol, forcing, f )
+    def in_cond( self, h0 ):
+        # Create an xr_dataset with initial conditions for zeta, sigma, and h
+        s0 = xr.Dataset()
+        for variable in self.stack_order:
+            s0[ variable ] = self.get_empty() # imaginary numbers 
+
+        s0['h'] = np.real( s0['h'] ) + h0 # force to be real nums
+        return s0
+
+    def reformat_state_to_vector( self, dataset ):
+        # Turn 2D array of current state into 1D with variables stacked.
+        # Dataset includes ocean solutions
+        full_stats = np.concatenate ( [ dataset[ variable ].values.flatten() \
+                                          for variable in self.stack_order ]  )
+        return full_stats
+
+    def variable_from_vector_state( self, vector_state, variable, time_dim = False ):
+        # From a vector state, extract a given variable
+        try:
+            # Find the index of A in B
+            index = self.stack_order.index( variable )
+        except:
+            print('Variable not written in stack_order')
+        dloc = [ index * self.npoints, ( index + 1 ) * self.npoints ]
+
+        # Now extract data, with or without time dimension
+        if time_dim:
+            return vector_state[ dloc[0] : dloc[1] , : ]
+        else:
+            return vector_state[ dloc[0] : dloc[1] ]
+    
+
+    def ML_accel1( self, t, ML_state ):
+        # Compute accelerations based on forcing and current mixed layer state
+        forcing = self.ERA5.sel( time = t , method = 'nearest' ) 
+
+        # Prepare to operate on the ML state itself
+        zeta = self.variable_from_vector_state( ML_state, 'zeta' );
+        sigma = self.variable_from_vector_state( ML_state, 'sigma' );
+        h = self.variable_from_vector_state( ML_state, 'h' )
         
+        # Turn forcing dataset into a vector of appropriate shape
+        forcing_vec = np.concatenate( [ forcing['tau'].values.flatten(), 
+                       forcing['G'].values.flatten(), 
+                       np.zeros(  ( self.npoints, ) ) ] )
+        # Distribute momentum over mixed layer mass
+        forcing_vec = forcing_vec / 1025 / 50; #np.concatenate( [ h, h, h ] )
+        
+        # Get vector with f values in vector format
+        fvec = ( ( np.abs(self.get_empty() ) + 1 ) * self.f ).values.flatten()
+
+        # Vector to add as acceleration
+        state_evol =np.concatenate( [ ( ( -1j - 0.35 ) * fvec ) * zeta  ,
+                      ( ( 1j - 0.35 ) * fvec ) * sigma ,
+                      - h * np.imag( sigma ) ] )
+        return state_evol + forcing_vec 
+
+    def ML_solver( self , h0 ):
+        # Invoke scipy solver to run mixed layer model
+        sol0 = self.reformat_state_to_vector( self.in_cond( h0 ) )
+        t_span = self.ERA5['time'].values
+        # All inputs go in, solution gets computed. Store solutions at all times.
+        solution = scipy.integrate.solve_ivp( self.ML_accel1,
+                                             t_span = [ t_span[0], t_span[-1] ],
+                                             y0 = sol0, t_eval = t_span )
+        # Now reshape and format solution as xarray dataset
+        solved = dict(); xr_solved = xr.Dataset()
+        print( solution.y.shape )
+        
+        for var in self.stack_order:
+            solved[ var ] = self.variable_from_vector_state( solution.y ,
+                                                        var , time_dim = True )
+            # Take individual timesteps and reshape them to store in xarray
+            map_shape = self.ERA5['tau'].isel( time = 0 ).shape
+            map_shape = [ map_shape[0], map_shape[1], 1 ]
+            # Reshape and concatenate snapshots
+            print( solved[var].shape )
+            solved[ var ] = np.concatenate( [ np.reshape( solved[var][ : , tt ] , newshape = map_shape ) \
+                              for tt in range( len( t_span ) ) ] , axis = 2 )
+
+            xr_solved[ var] = xr.DataArray( data = solved[var] , dims = ('latitude','longitude','time'), 
+                                           coords = self.ERA5['tau'].coords )
+
+            
+        return xr_solved
+
+
 class decker_solver:
     def __init__( self, ml_sol, th_sol, forcing, f ):
         self.ml_sol = ml_sol;
@@ -243,7 +323,7 @@ class decker_solver:
         else:
             # energy transfer from thermocline to ML
             r = 0        
-
+        r = self.f * 0.3
         self.r[tind] = r; 
         dUdt = - r * ml_now['zeta']; 
         dSdt = - r * ml_now['sigma']; 
